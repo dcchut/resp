@@ -1,16 +1,16 @@
 //! RESP serialize
 
-use std::vec::Vec;
 use std::string::String;
-use std::io::{Read, BufRead, BufReader, Result, Error, ErrorKind};
+use std::vec::Vec;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, Error, ErrorKind, Result};
 
 use super::Value;
 
 /// up to 512 MB in length
 const RESP_MAX_SIZE: i64 = 512 * 1024 * 1024;
-const CRLF_BYTES: &'static [u8] = b"\r\n";
-const NULL_BYTES: &'static [u8] = b"$-1\r\n";
-const NULL_ARRAY_BYTES: &'static [u8] = b"*-1\r\n";
+const CRLF_BYTES: &[u8] = b"\r\n";
+const NULL_BYTES: &[u8] = b"$-1\r\n";
+const NULL_ARRAY_BYTES: &[u8] = b"*-1\r\n";
 
 /// Encodes RESP value to RESP binary buffer.
 /// # Examples
@@ -35,7 +35,10 @@ pub fn encode(value: &Value) -> Vec<u8> {
 ///            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n".to_string().into_bytes());
 /// ```
 pub fn encode_slice(slice: &[&str]) -> Vec<u8> {
-    let array: Vec<Value> = slice.iter().map(|string| Value::Bulk(string.to_string())).collect();
+    let array: Vec<Value> = slice
+        .iter()
+        .map(|string| Value::Bulk(string.to_string()))
+        .collect();
     let mut res: Vec<u8> = Vec::new();
     buf_encode(&Value::Array(array), &mut res);
     res
@@ -97,7 +100,7 @@ pub struct Decoder<R> {
     reader: BufReader<R>,
 }
 
-impl<R: Read> Decoder<R> {
+impl<R: AsyncRead + Unpin + Send> Decoder<R> {
     /// Creates a Decoder instance with given BufReader for decoding the RESP buffers.
     /// # Examples
     /// ```
@@ -112,7 +115,7 @@ impl<R: Read> Decoder<R> {
     pub fn new(reader: BufReader<R>) -> Self {
         Decoder {
             buf_bulk: false,
-            reader: reader,
+            reader,
         }
     }
 
@@ -132,21 +135,28 @@ impl<R: Read> Decoder<R> {
     pub fn with_buf_bulk(reader: BufReader<R>) -> Self {
         Decoder {
             buf_bulk: true,
-            reader: reader,
+            reader,
         }
     }
 
     /// It will read buffers from the inner BufReader, decode it to a Value.
-    pub fn decode(&mut self) -> Result<Value> {
+    #[async_recursion::async_recursion]
+    pub async fn decode(&mut self) -> Result<Value> {
         let mut res: Vec<u8> = Vec::new();
-        self.reader.read_until(b'\n', &mut res)?;
+        self.reader.read_until(b'\n', &mut res).await?;
 
         let len = res.len();
         if len < 3 {
-            return Err(Error::new(ErrorKind::InvalidInput, format!("too short: {}", len)));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("too short: {}", len),
+            ));
         }
         if !is_crlf(res[len - 2], res[len - 1]) {
-            return Err(Error::new(ErrorKind::InvalidInput, format!("invalid CRLF: {:?}", res)));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid CRLF: {:?}", res),
+            ));
         }
 
         let bytes = res[1..len - 2].as_ref();
@@ -165,17 +175,21 @@ impl<R: Read> Decoder<R> {
                     return Ok(Value::Null);
                 }
                 if int < -1 || int >= RESP_MAX_SIZE {
-                    return Err(Error::new(ErrorKind::InvalidInput,
-                                          format!("invalid bulk length: {}", int)));
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid bulk length: {}", int),
+                    ));
                 }
 
                 let mut buf: Vec<u8> = Vec::new();
                 let int = int as usize;
                 buf.resize(int + 2, 0);
-                self.reader.read_exact(buf.as_mut_slice())?;
+                self.reader.read_exact(buf.as_mut_slice()).await?;
                 if !is_crlf(buf[int], buf[int + 1]) {
-                    return Err(Error::new(ErrorKind::InvalidInput,
-                                          format!("invalid CRLF: {:?}", buf)));
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid CRLF: {:?}", buf),
+                    ));
                 }
                 buf.truncate(int);
                 if self.buf_bulk {
@@ -191,21 +205,23 @@ impl<R: Read> Decoder<R> {
                     return Ok(Value::NullArray);
                 }
                 if int < -1 || int >= RESP_MAX_SIZE {
-                    return Err(Error::new(ErrorKind::InvalidInput,
-                                          format!("invalid array length: {}", int)));
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid array length: {}", int),
+                    ));
                 }
 
                 let mut array: Vec<Value> = Vec::with_capacity(int as usize);
                 for _ in 0..int {
-                    let val = self.decode()?;
+                    let val = self.decode().await?;
                     array.push(val);
                 }
                 Ok(Value::Array(array))
             }
-            prefix => {
-                Err(Error::new(ErrorKind::InvalidInput,
-                               format!("invalid RESP type: {:?}", prefix)))
-            }
+            prefix => Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid RESP type: {:?}", prefix),
+            )),
         }
     }
 }
@@ -228,8 +244,8 @@ fn parse_integer(bytes: &[u8]) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::Value;
+    use super::*;
 
     struct Case {
         data: Vec<u8>,
@@ -239,112 +255,139 @@ mod tests {
     #[test]
     fn fn_encode_slice() {
         let array = ["SET", "a", "1"];
-        assert_eq!(String::from_utf8(encode_slice(&array)).unwrap(),
-                   "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        assert_eq!(
+            String::from_utf8(encode_slice(&array)).unwrap(),
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
 
         let array = vec!["SET", "a", "1"];
-        assert_eq!(String::from_utf8(encode_slice(&array)).unwrap(),
-                   "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        assert_eq!(
+            String::from_utf8(encode_slice(&array)).unwrap(),
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
     }
 
     #[test]
     fn struct_decoder() {
-        let cases: &[Case] =
-            &[Case {
-                  data: "+\r\n".to_string().into_bytes(),
-                  want: Value::String("".to_string()),
-              },
-              Case {
-                  data: "+OK\r\n".to_string().into_bytes(),
-                  want: Value::String("OK".to_string()),
-              },
-              Case {
-                  data: "+中文\r\n".to_string().into_bytes(),
-                  want: Value::String("中文".to_string()),
-              },
-              Case {
-                  data: "-Error message\r\n".to_string().into_bytes(),
-                  want: Value::Error("Error message".to_string()),
-              },
-              Case {
-                  data: ":-1\r\n".to_string().into_bytes(),
-                  want: Value::Integer(-1),
-              },
-              Case {
-                  data: ":0\r\n".to_string().into_bytes(),
-                  want: Value::Integer(0),
-              },
-              Case {
-                  data: ":1456061893587000000\r\n".to_string().into_bytes(),
-                  want: Value::Integer(1456061893587000000),
-              },
-              Case {
-                  data: "$-1\r\n".to_string().into_bytes(),
-                  want: Value::Null,
-              },
-              Case {
-                  data: "$0\r\n\r\n".to_string().into_bytes(),
-                  want: Value::Bulk("".to_string()),
-              },
-              Case {
-                  data: "$6\r\nfoobar\r\n".to_string().into_bytes(),
-                  want: Value::Bulk("foobar".to_string()),
-              },
-              Case {
-                  data: "$6\r\n中文\r\n".to_string().into_bytes(),
-                  want: Value::Bulk("中文".to_string()),
-              },
-              Case {
-                  data: "$17\r\n你好！\n 换行\r\n".to_string().into_bytes(),
-                  want: Value::Bulk("你好！\n 换行".to_string()),
-              },
-              Case {
-                  data: "*-1\r\n".to_string().into_bytes(),
-                  want: Value::NullArray,
-              },
-              Case {
-                  data: "*0\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![]),
-              },
-              Case {
-                  data: "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::Bulk("foo".to_string()),
-                                          Value::Bulk("bar".to_string())]),
-              },
-              Case {
-                  data: "*3\r\n:1\r\n:2\r\n:3\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]),
-              },
-              Case {
-                  data: "*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::Integer(1),
-                                          Value::Integer(2),
-                                          Value::Integer(3),
-                                          Value::Integer(4),
-                                          Value::Bulk("foobar".to_string())]),
-              },
-              Case {
-                  data: "*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Foo\r\n-Bar\r\n"
-                      .to_string()
-                      .into_bytes(),
-                  want: Value::Array(vec![Value::Array(vec![Value::Integer(1),
-                                                            Value::Integer(2),
-                                                            Value::Integer(3)]),
-                                          Value::Array(vec![Value::String("Foo".to_string()),
-                                                            Value::Error("Bar".to_string())])]),
-              },
-              Case {
-                  data: "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::Bulk("foo".to_string()),
-                                          Value::Null,
-                                          Value::Bulk("bar".to_string())]),
-              },
-              Case {
-                  data: encode_slice(&vec!["SET", "a", "1"]),
-                  want: Value::Array(vec![Value::Bulk("SET".to_string()),
-                                          Value::Bulk("a".to_string()),
-                                          Value::Bulk("1".to_string())]),
-              }];
+        let cases: &[Case] = &[
+            Case {
+                data: "+\r\n".to_string().into_bytes(),
+                want: Value::String("".to_string()),
+            },
+            Case {
+                data: "+OK\r\n".to_string().into_bytes(),
+                want: Value::String("OK".to_string()),
+            },
+            Case {
+                data: "+中文\r\n".to_string().into_bytes(),
+                want: Value::String("中文".to_string()),
+            },
+            Case {
+                data: "-Error message\r\n".to_string().into_bytes(),
+                want: Value::Error("Error message".to_string()),
+            },
+            Case {
+                data: ":-1\r\n".to_string().into_bytes(),
+                want: Value::Integer(-1),
+            },
+            Case {
+                data: ":0\r\n".to_string().into_bytes(),
+                want: Value::Integer(0),
+            },
+            Case {
+                data: ":1456061893587000000\r\n".to_string().into_bytes(),
+                want: Value::Integer(1456061893587000000),
+            },
+            Case {
+                data: "$-1\r\n".to_string().into_bytes(),
+                want: Value::Null,
+            },
+            Case {
+                data: "$0\r\n\r\n".to_string().into_bytes(),
+                want: Value::Bulk("".to_string()),
+            },
+            Case {
+                data: "$6\r\nfoobar\r\n".to_string().into_bytes(),
+                want: Value::Bulk("foobar".to_string()),
+            },
+            Case {
+                data: "$6\r\n中文\r\n".to_string().into_bytes(),
+                want: Value::Bulk("中文".to_string()),
+            },
+            Case {
+                data: "$17\r\n你好！\n 换行\r\n".to_string().into_bytes(),
+                want: Value::Bulk("你好！\n 换行".to_string()),
+            },
+            Case {
+                data: "*-1\r\n".to_string().into_bytes(),
+                want: Value::NullArray,
+            },
+            Case {
+                data: "*0\r\n".to_string().into_bytes(),
+                want: Value::Array(vec![]),
+            },
+            Case {
+                data: "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_string().into_bytes(),
+                want: Value::Array(vec![
+                    Value::Bulk("foo".to_string()),
+                    Value::Bulk("bar".to_string()),
+                ]),
+            },
+            Case {
+                data: "*3\r\n:1\r\n:2\r\n:3\r\n".to_string().into_bytes(),
+                want: Value::Array(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ]),
+            },
+            Case {
+                data: "*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n"
+                    .to_string()
+                    .into_bytes(),
+                want: Value::Array(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                    Value::Integer(4),
+                    Value::Bulk("foobar".to_string()),
+                ]),
+            },
+            Case {
+                data: "*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Foo\r\n-Bar\r\n"
+                    .to_string()
+                    .into_bytes(),
+                want: Value::Array(vec![
+                    Value::Array(vec![
+                        Value::Integer(1),
+                        Value::Integer(2),
+                        Value::Integer(3),
+                    ]),
+                    Value::Array(vec![
+                        Value::String("Foo".to_string()),
+                        Value::Error("Bar".to_string()),
+                    ]),
+                ]),
+            },
+            Case {
+                data: "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n"
+                    .to_string()
+                    .into_bytes(),
+                want: Value::Array(vec![
+                    Value::Bulk("foo".to_string()),
+                    Value::Null,
+                    Value::Bulk("bar".to_string()),
+                ]),
+            },
+            Case {
+                data: encode_slice(&vec!["SET", "a", "1"]),
+                want: Value::Array(vec![
+                    Value::Bulk("SET".to_string()),
+                    Value::Bulk("a".to_string()),
+                    Value::Bulk("1".to_string()),
+                ]),
+            },
+        ];
 
         // Single Decode
         for case in cases {
@@ -367,102 +410,125 @@ mod tests {
 
     #[test]
     fn struct_decoder_with_buf_bulk() {
-        let cases: &[Case] =
-            &[Case {
-                  data: "+\r\n".to_string().into_bytes(),
-                  want: Value::String("".to_string()),
-              },
-              Case {
-                  data: "+OK\r\n".to_string().into_bytes(),
-                  want: Value::String("OK".to_string()),
-              },
-              Case {
-                  data: "+中文\r\n".to_string().into_bytes(),
-                  want: Value::String("中文".to_string()),
-              },
-              Case {
-                  data: "-Error message\r\n".to_string().into_bytes(),
-                  want: Value::Error("Error message".to_string()),
-              },
-              Case {
-                  data: ":-1\r\n".to_string().into_bytes(),
-                  want: Value::Integer(-1),
-              },
-              Case {
-                  data: ":0\r\n".to_string().into_bytes(),
-                  want: Value::Integer(0),
-              },
-              Case {
-                  data: ":1456061893587000000\r\n".to_string().into_bytes(),
-                  want: Value::Integer(1456061893587000000),
-              },
-              Case {
-                  data: "$-1\r\n".to_string().into_bytes(),
-                  want: Value::Null,
-              },
-              Case {
-                  data: "$0\r\n\r\n".to_string().into_bytes(),
-                  want: Value::BufBulk("".to_string().into_bytes()),
-              },
-              Case {
-                  data: "$6\r\nfoobar\r\n".to_string().into_bytes(),
-                  want: Value::BufBulk("foobar".to_string().into_bytes()),
-              },
-              Case {
-                  data: "$6\r\n中文\r\n".to_string().into_bytes(),
-                  want: Value::BufBulk("中文".to_string().into_bytes()),
-              },
-              Case {
-                  data: "$17\r\n你好！\n 换行\r\n".to_string().into_bytes(),
-                  want: Value::BufBulk("你好！\n 换行".to_string().into_bytes()),
-              },
-              Case {
-                  data: "*-1\r\n".to_string().into_bytes(),
-                  want: Value::NullArray,
-              },
-              Case {
-                  data: "*0\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![]),
-              },
-              Case {
-                  data: "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::BufBulk("foo".to_string().into_bytes()),
-                                          Value::BufBulk("bar".to_string().into_bytes())]),
-              },
-              Case {
-                  data: "*3\r\n:1\r\n:2\r\n:3\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]),
-              },
-              Case {
-                  data: "*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::Integer(1),
-                                          Value::Integer(2),
-                                          Value::Integer(3),
-                                          Value::Integer(4),
-                                          Value::BufBulk("foobar".to_string().into_bytes())]),
-              },
-              Case {
-                  data: "*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Foo\r\n-Bar\r\n"
-                      .to_string()
-                      .into_bytes(),
-                  want: Value::Array(vec![Value::Array(vec![Value::Integer(1),
-                                                            Value::Integer(2),
-                                                            Value::Integer(3)]),
-                                          Value::Array(vec![Value::String("Foo".to_string()),
-                                                            Value::Error("Bar".to_string())])]),
-              },
-              Case {
-                  data: "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n".to_string().into_bytes(),
-                  want: Value::Array(vec![Value::BufBulk("foo".to_string().into_bytes()),
-                                          Value::Null,
-                                          Value::BufBulk("bar".to_string().into_bytes())]),
-              },
-              Case {
-                  data: encode_slice(&vec!["SET", "a", "1"]),
-                  want: Value::Array(vec![Value::BufBulk("SET".to_string().into_bytes()),
-                                          Value::BufBulk("a".to_string().into_bytes()),
-                                          Value::BufBulk("1".to_string().into_bytes())]),
-              }];
+        let cases: &[Case] = &[
+            Case {
+                data: "+\r\n".to_string().into_bytes(),
+                want: Value::String("".to_string()),
+            },
+            Case {
+                data: "+OK\r\n".to_string().into_bytes(),
+                want: Value::String("OK".to_string()),
+            },
+            Case {
+                data: "+中文\r\n".to_string().into_bytes(),
+                want: Value::String("中文".to_string()),
+            },
+            Case {
+                data: "-Error message\r\n".to_string().into_bytes(),
+                want: Value::Error("Error message".to_string()),
+            },
+            Case {
+                data: ":-1\r\n".to_string().into_bytes(),
+                want: Value::Integer(-1),
+            },
+            Case {
+                data: ":0\r\n".to_string().into_bytes(),
+                want: Value::Integer(0),
+            },
+            Case {
+                data: ":1456061893587000000\r\n".to_string().into_bytes(),
+                want: Value::Integer(1456061893587000000),
+            },
+            Case {
+                data: "$-1\r\n".to_string().into_bytes(),
+                want: Value::Null,
+            },
+            Case {
+                data: "$0\r\n\r\n".to_string().into_bytes(),
+                want: Value::BufBulk("".to_string().into_bytes()),
+            },
+            Case {
+                data: "$6\r\nfoobar\r\n".to_string().into_bytes(),
+                want: Value::BufBulk("foobar".to_string().into_bytes()),
+            },
+            Case {
+                data: "$6\r\n中文\r\n".to_string().into_bytes(),
+                want: Value::BufBulk("中文".to_string().into_bytes()),
+            },
+            Case {
+                data: "$17\r\n你好！\n 换行\r\n".to_string().into_bytes(),
+                want: Value::BufBulk("你好！\n 换行".to_string().into_bytes()),
+            },
+            Case {
+                data: "*-1\r\n".to_string().into_bytes(),
+                want: Value::NullArray,
+            },
+            Case {
+                data: "*0\r\n".to_string().into_bytes(),
+                want: Value::Array(vec![]),
+            },
+            Case {
+                data: "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_string().into_bytes(),
+                want: Value::Array(vec![
+                    Value::BufBulk("foo".to_string().into_bytes()),
+                    Value::BufBulk("bar".to_string().into_bytes()),
+                ]),
+            },
+            Case {
+                data: "*3\r\n:1\r\n:2\r\n:3\r\n".to_string().into_bytes(),
+                want: Value::Array(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ]),
+            },
+            Case {
+                data: "*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n"
+                    .to_string()
+                    .into_bytes(),
+                want: Value::Array(vec![
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                    Value::Integer(4),
+                    Value::BufBulk("foobar".to_string().into_bytes()),
+                ]),
+            },
+            Case {
+                data: "*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Foo\r\n-Bar\r\n"
+                    .to_string()
+                    .into_bytes(),
+                want: Value::Array(vec![
+                    Value::Array(vec![
+                        Value::Integer(1),
+                        Value::Integer(2),
+                        Value::Integer(3),
+                    ]),
+                    Value::Array(vec![
+                        Value::String("Foo".to_string()),
+                        Value::Error("Bar".to_string()),
+                    ]),
+                ]),
+            },
+            Case {
+                data: "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n"
+                    .to_string()
+                    .into_bytes(),
+                want: Value::Array(vec![
+                    Value::BufBulk("foo".to_string().into_bytes()),
+                    Value::Null,
+                    Value::BufBulk("bar".to_string().into_bytes()),
+                ]),
+            },
+            Case {
+                data: encode_slice(&vec!["SET", "a", "1"]),
+                want: Value::Array(vec![
+                    Value::BufBulk("SET".to_string().into_bytes()),
+                    Value::BufBulk("a".to_string().into_bytes()),
+                    Value::BufBulk("1".to_string().into_bytes()),
+                ]),
+            },
+        ];
 
         for case in cases {
             let mut decoder = Decoder::with_buf_bulk(BufReader::new(case.data.as_slice()));
@@ -488,11 +554,9 @@ mod tests {
         let mut decoder = Decoder::new(BufReader::new(buf));
         assert!(decoder.decode().is_err());
 
-
         let buf = Value::String("OK正".to_string()).encode();
         let mut decoder = Decoder::new(BufReader::new(buf.as_slice()));
-        assert_eq!(decoder.decode().unwrap(),
-                   Value::String("OK正".to_string()));
+        assert_eq!(decoder.decode().unwrap(), Value::String("OK正".to_string()));
         assert!(decoder.decode().is_err());
 
         let mut buf = Value::String("OK正".to_string()).encode();
@@ -500,7 +564,6 @@ mod tests {
         buf.remove(5);
         let mut decoder = Decoder::new(BufReader::new(buf.as_slice()));
         assert!(decoder.decode().is_err());
-
 
         let buf = "$\r\n".to_string().into_bytes();
         let mut decoder = Decoder::new(BufReader::new(buf.as_slice()));
@@ -532,7 +595,9 @@ mod tests {
         let mut decoder = Decoder::new(BufReader::new(buf.as_slice()));
         assert!(decoder.decode().is_err());
 
-        let buf = "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nba".to_string().into_bytes();
+        let buf = "*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nba"
+            .to_string()
+            .into_bytes();
         let mut decoder = Decoder::new(BufReader::new(buf.as_slice()));
         assert!(decoder.decode().is_err());
     }

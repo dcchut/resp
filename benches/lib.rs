@@ -1,25 +1,28 @@
 #![feature(test)]
 
-extern crate test;
 extern crate resp;
+extern crate test;
 
-use test::Bencher;
+use resp::{Decoder, Value};
 use std::io::BufReader;
-use resp::{Value, Decoder};
+use test::Bencher;
 
 fn prepare_values() -> Value {
-    let a = vec![Value::Null,
-             Value::NullArray,
-             Value::String("OKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOK"
-                               .to_string()),
-             Value::Error("ErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErr"
-                              .to_string()),
-             Value::Integer(1234567890),
-             Value::Bulk("Bulk String Bulk String Bulk String Bulk String Bulk String Bulk String"
-                             .to_string()),
-             Value::Array(vec![Value::Null,
-                               Value::Integer(123),
-                               Value::Bulk("Bulk String Bulk String".to_string())])];
+    let a = vec![
+        Value::Null,
+        Value::NullArray,
+        Value::String("OKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOKOK".to_string()),
+        Value::Error("ErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErrErr".to_string()),
+        Value::Integer(1234567890),
+        Value::Bulk(
+            "Bulk String Bulk String Bulk String Bulk String Bulk String Bulk String".to_string(),
+        ),
+        Value::Array(vec![
+            Value::Null,
+            Value::Integer(123),
+            Value::Bulk("Bulk String Bulk String".to_string()),
+        ]),
+    ];
     let mut b = a.clone();
     b.push(Value::Array(a));
     b.push(Value::Null);
@@ -46,8 +49,8 @@ fn decode_values(b: &mut Bencher) {
     let value = prepare_values();
     let buf = value.encode();
     b.iter(|| {
-               let mut decoder = Decoder::new(BufReader::new(buf.as_slice()));
-               assert_eq!(decoder.decode().unwrap(), value);
-               assert!(decoder.decode().is_err());
-           });
+        let mut decoder = Decoder::new(BufReader::new(buf.as_slice()));
+        assert_eq!(decoder.decode().unwrap(), value);
+        assert!(decoder.decode().is_err());
+    });
 }
